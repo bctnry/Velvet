@@ -144,15 +144,22 @@
 (define (_call name . argList)
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
-      (let* ([bound-values
-              (let ([stack stack])
+      (let* ([called-func (lookup name localEnv)]
+             [called-func-arglist (DefinedValue-argList called-func)]
+             [bound-values
+              (let* ([lenArg (length argList)]
+                     [lenDefArg (length called-func-arglist)]
+                     [argList (if (< lenArg lenDefArg)
+                                  (append argList
+                                          (for/list ([i (in-list (take stack (- lenDefArg lenArg)))])
+                                            (_lit i)))
+                                  argList)]
+                    [stack stack])
                 (for/list ([i (in-list argList)])
                   (if (equal? i '?)
                       (let ([arg (car stack)]) (begin (set! stack (cdr stack)) arg))
                       (let ([evaluatedState (evaluator state (list i))])
                         (car (MachineState-stack evaluatedState))))))]
-             [called-func (lookup name localEnv)]
-             [called-func-arglist (DefinedValue-argList called-func)]
              [bound-env (aux/multibind called-func-arglist bound-values (make-bindingEnv))])
         ;; TODO: handle the case where argList is smaller than the arglist defined in the env.
         (evaluator (MachineState (Env localEnv bound-env) stack)
@@ -163,16 +170,6 @@
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
       (MachineState localEnv (cons (- (car stack) 1) (cdr stack))))))
-;; _lt :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
-(define (_lt x)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (< (car stack) x) stack)))))
-;; _eq :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
-(define (_eq x)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (equal? x (car stack)) stack)))))
 
 (define (aux/fromrkt fun argn)
   (λ (evaluator state)
@@ -213,7 +210,20 @@
 (define _isboolean (aux/fromrkt* boolean? 1))
 (define _isinteger (aux/fromrkt* exact-integer? 1))
 (define _isfloat (aux/fromrkt* (λ (x) (and (not (exact-integer? x)) (real? x))) 1))
-
+;; _lt :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
+(define (_lt x)
+  (λ (evaluator state)
+    (let-values ([(localEnv stack) (toValues state)])
+      (MachineState localEnv (cons (< (car stack) x) stack)))))
+;; _eq :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
+(define (_eq x)
+  (λ (evaluator state)
+    (let-values ([(localEnv stack) (toValues state)])
+      (MachineState localEnv (cons (equal? x (car stack)) stack)))))
+(define (_gt x)
+  (λ (evaluator state)
+    (let-values ([(localEnv stack) (toValues state)])
+      (MachineState localEnv (cons (> (car stack) x) stack)))))
 ;; predicate combinators.
 (define (_and x . rst)
   (λ (evaluator state)
@@ -309,8 +319,8 @@
          env))
 (define emptyEnv (Env #f (make-bindingEnv)))
 (define st (MachineState emptyEnv '()))
-#|
-(velvet-evaluator
+
+(evaluator
  st
  `(,(_quoted `(,(_load 'x) ,_dup))
    ,(_define 'mydup '(x))
@@ -324,9 +334,9 @@
            ))))
    ,(_define 'factorial '(x))
    ,(_lit 5)
-   ,(_call 'factorial '?)
+   ,(_call 'factorial)
    ))
-|#
+#|
 (evaluator
  st
  `(,(_lit 3)
@@ -335,6 +345,7 @@
    ,(_lit 3)
    ,_putbefore
    ))
+|#
 #|
 (velvet-evaluator
  st
