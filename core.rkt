@@ -1,6 +1,9 @@
 #lang racket
+
 ;; velvet.
 ;; (c) sebastian lin. 2018
+
+(require compatibility/defmacro)
 
 #|
 "fac"
@@ -27,6 +30,12 @@
   (fac_iter ? 1))
 |#
 
+
+;; rules:
+;; 1. every primitive takes arguments (or takes no arguments)  & perform transformations on stack.
+;; 2. all arguments are commands that will be evaluated on the stack of the calling machine state.
+;;    when the evaluation is done, the top of the stack is taken as the result value.
+
 (struct MachineState (localEnv stack) #:transparent)
 (define (toValues machineState)
   (values (MachineState-localEnv machineState)
@@ -52,21 +61,25 @@
 ;; TODO:
 ;; 3. complete _call & other primitives.
 
+;; to construct a primitive.
+(defmacro define-primitive (calling x)
+  `(define ,calling
+     (λ (evaluator state)
+       (let-values ([(env stack) (toValues state)])
+         ,x))))
+
 ;; _dup :: {}[x:Any] -> [x:Any, x:Any]
-(define _dup
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (car stack) stack)))))
+(define-primitive _dup
+  (MachineState env (cons (car stack) stack)))
+
 ;; _pop :: {}[x:Any] -> []
-(define _pop
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cdr stack)))))
+(define-primitive _pop
+  (MachineState env (cdr stack)))
+
 ;; _swap :: {}[x:Any, y:Any] -> [y:Any, x:Any]
-(define _swap
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (cadr stack) (cons (car stack) (cddr stack)))))))
+(define-primitive _swap
+  (MachineState env (append (list (cadr stack) (car stack)) (cddr stack))))
+
 ;; _quoted :: {cmdlist:Meta(Listof(Command))}[] -> [cmdlist:QuotedVal]
 (define-syntax-rule (_quoted x)
   (λ (evaluator state)
@@ -82,6 +95,7 @@
                     (cons (QuotedValue (QuotedValue-env (car stack))
                                        (aux/nth n (QuotedValue-cmdList (car stack))))
                           stack)))))
+
 ;; _exec :: {}[x:QuotedValue(A->B), A] -> [B]
 (define _exec
   (λ (evaluator state)
@@ -92,138 +106,163 @@
                         (QuotedValue-cmdList (car stack)))])
       (MachineState (Env-parentEnv (MachineState-localEnv evaluatedState))
                     (MachineState-stack evaluatedState))))))
+
 ;; _branch :: {iftrue:QuotedValue(A->B), iffalse:QuotedValue(A->C)}[cond:Boolean, A]
 ;;         -> [B] or [C]
-(define (_branch x y)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (let ([consumedState (MachineState localEnv (cdr stack))])
-        (if (car stack)
-            (evaluator consumedState x)
-            (evaluator consumedState y))))))
+(define-primitive (_branch x y)
+  (let ([consumedState (MachineState env (cdr stack))])
+    (evaluator consumedState (if (car stack) x y))))
+
 ;; _name :: {x:Meta(Symbol)}[] -> []
-(define (_name x)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState (bind-env x (car stack) localEnv) stack))))
+(define-primitive (_name x)
+  (MachineState (bind-env x (car stack) env) stack))
+
 ;; _load :: {x:Meta(Symbol)}[] -> [value:Meta(TypeOfName(x))]
-(define (_load x)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (let ([lookupRes (lookup x localEnv)])
-        (if lookupRes
-            (MachineState localEnv (cons lookupRes stack))
-            (begin (raise "Fail to lookup in the current environment.") state))))))
-(define _begin
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState (Env localEnv (make-bindingEnv)) stack))))
-(define _end
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState (Env-parentEnv localEnv) stack))))
+(define-primitive (_load x)
+  (let ([lookupRes (lookup x env)])
+    (if lookupRes
+        (MachineState env (cons lookupRes stack))
+        (begin (raise "Fail to lookup in the current environment.") state))))
+
+(define-primitive _begin
+  (MachineState (Env env (make-bindingEnv)) stack))
+
+(define-primitive _end
+  (MachineState (Env-parentEnv env) stack))
+
 ;; _define :: {x:Meta(Symbol), y:Meta(Listof(Symbol))}[body:QuotedValue]
 ;;         -> []
-(define (_define name argList)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      ;; here, we need a little side effect to cope this...
-      (let ([preDefVal (DefinedValue localEnv name argList (car stack))])
-        (begin (set-DefinedValue-env! preDefVal (Env localEnv (bind-singl name preDefVal (make-bindingEnv))))
-               (MachineState (bind-env name preDefVal localEnv)
-                             (cdr stack)))))))
+(define-primitive (_define name argList)
+  (let ([predefval (DefinedValue env name argList (car stack))])
+    (begin (set-DefinedValue-env! predefval (Env env (bind-singl name predefval (make-bindingEnv))))
+           (MachineState (bind-env name predefval env) (cdr stack)))))
+
 ;; _lit :: {x:Any}[] -> [x:Any]
-(define (_lit literal)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons literal stack)))))
-(define (_immediate . cmdList)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (evaluator (MachineState localEnv stack) cmdList))))
-(define (_call name . argList)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (let* ([called-func (lookup name localEnv)]
-             [called-func-arglist (DefinedValue-argList called-func)]
-             [bound-values
-              (let* ([lenArg (length argList)]
-                     [lenDefArg (length called-func-arglist)]
-                     [argList (if (< lenArg lenDefArg)
-                                  (append argList
-                                          (for/list ([i (in-list (take stack (- lenDefArg lenArg)))])
-                                            (_lit i)))
-                                  argList)]
-                    [stack stack])
-                (for/list ([i (in-list argList)])
-                  (if (equal? i '?)
-                      (let ([arg (car stack)]) (begin (set! stack (cdr stack)) arg))
-                      (let ([evaluatedState (evaluator state (list i))])
-                        (car (MachineState-stack evaluatedState))))))]
-             [bound-env (aux/multibind called-func-arglist bound-values (make-bindingEnv))])
-        ;; TODO: handle the case where argList is smaller than the arglist defined in the env.
-        (evaluator (MachineState (Env localEnv bound-env) stack)
-                   (append (QuotedValue-cmdList (DefinedValue-body called-func))
-                           (list _end)))))))
-;; _dec :: {}[x:Number] -> [result:Number]
-(define _dec
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (- (car stack) 1) (cdr stack))))))
+(define-primitive (_lit literal)
+  (MachineState env (cons literal stack)))
 
-(define (aux/fromrkt fun argn)
+(define-primitive (_immediate . cmdList)
+  (evaluator state cmdList))
+
+;; turn a QuotedValue into an anonymous (name equals to '?) DefinedValue.
+(define-primitive (_abs . argList)
+  (let ([quotedVal (car stack)])
+    (let ([qenv (QuotedValue-env quotedVal)]
+          [qbody (QuotedValue-cmdList quotedVal)])
+      (MachineState env (cons (DefinedValue qenv '? argList qbody) (cdr stack))))))
+
+;; turn a DefinedValue into a QuotedValue
+(define-primitive _deabs
+  (let ([definedVal (car stack)])
+    (let ([denv (DefinedValue-env definedVal)]
+          [dcmdList (DefinedValue-body definedVal)])
+      (MachineState env (cons (QuotedValue denv dcmdList) (cdr stack))))))
+
+(define-primitive (_call name . argList)
+  (let* ([called-func (if (equal? name '?) (car stack) (lookup name env))]
+         [called-func-arglist (DefinedValue-argList called-func)]
+         [bound-values
+          (let* ([lenArg (length argList)]
+                 [lenDefArg (length called-func-arglist)]
+                 [argList
+                  (if (< lenArg lenDefArg)
+                      (append argList
+                              (for/list ([i (in-list (take stack (- lenDefArg lenArg)))])
+                                (_lit i)))
+                      argList)])
+            (for/list ([i (in-list argList)])
+              (if (equal? i '?)
+                  (let ([arg (car stack)]) (begin (set! stack (cdr stack)) arg))
+                  (let ([evaluatedState (evaluator state (list i))])
+                    (car (MachineState-stack evaluatedState))))))]
+         [bound-env (aux/multibind called-func-arglist bound-values (make-bindingEnv))])
+    (evaluator (MachineState (Env env bound-env) stack)
+               (append (QuotedValue-cmdList (DefinedValue-body called-func))
+                       (list _end)))))
+
+(define (aux/fromrkt fun argn leaving)
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
-      (let-values ([(args rst) (split-at stack argn)])
+      (let ([args (take stack argn)]
+            [rst (drop stack (- argn leaving))])
         (MachineState localEnv (cons (apply fun args) rst))))))
+(define (aux/fromrkt^ fun argn leaving)
+  (λ (evaluator state)
+    (let-values ([(localEnv stack) (toValues state)])
+      (let ([args (take stack argn)]
+            [rst (drop stack (- argn leaving))])
+        (MachineState localEnv (cons (apply fun (reverse args)) rst))))))
+(define (aux/fromrkt.vararg fun leaveval?)
+  (λ argList
+    (λ (evaluator state)
+      (let-values ([(localEnv stack) (toValues state)])
+        (let ([valList (for/list ([i (in-list argList)])
+                         (car (MachineState-stack (evaluator state (list i)))))])
+          (MachineState localEnv (cons (apply fun valList) (if leaveval? stack (cdr stack)))))))))
+;; primitives for numbers.
+(define _mult (aux/fromrkt * 2 0))
+(define _plus (aux/fromrkt + 2 0))
+(define _minus (aux/fromrkt^ - 2 0))
+(define _div (aux/fromrkt^ / 2 0))
+(define _intdiv (aux/fromrkt^ quotient 2 0))
+(define _mod (aux/fromrkt^ modulo 2 0))
+(define _bitand (aux/fromrkt bitwise-and 2 0))
+(define _bitor (aux/fromrkt bitwise-ior 2 0))
+(define _bitxor (aux/fromrkt bitwise-xor 2 0))
+(define _bitnot (aux/fromrkt bitwise-not 1 0))
+(define _multiplus (aux/fromrkt.vararg + #f))
+(define _multimult (aux/fromrkt.vararg * #f))
 
-;; primitives for numbers. 
-(define _mult (aux/fromrkt * 2))
-(define _plus (aux/fromrkt + 2))
-(define _minus
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (- (cadr stack) (car stack)) (cddr stack))))))
-(define _div
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (/ (cadr stack) (car stack)) (cddr stack))))))
-(define _intdiv
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (quotient (cadr stack) (car stack)) (cddr stack))))))
-(define _mod
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (modulo (cadr stack) (car stack)) (cddr stack))))))
-  
-
-(define (aux/fromrkt* fun argn)
-  (λ (evaluator state)
-    (let-values ([(localEnv stack) (toValues state)])
-      (let-values ([(args rst) (split-at stack argn)])
-        (MachineState localEnv (cons (apply fun args) stack))))))
 
 ;; predicates.
-(define _isstring (aux/fromrkt* string? 1))
-(define _isquoted (aux/fromrkt* QuotedValue? 1))
-(define _isboolean (aux/fromrkt* boolean? 1))
-(define _isinteger (aux/fromrkt* exact-integer? 1))
-(define _isfloat (aux/fromrkt* (λ (x) (and (not (exact-integer? x)) (real? x))) 1))
-;; _lt :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
-(define (_lt x)
+(define _isstring (aux/fromrkt string? 1 1))
+(define _isquoted (aux/fromrkt QuotedValue? 1 1))
+(define _isboolean (aux/fromrkt boolean? 1 1))
+(define _isinteger (aux/fromrkt exact-integer? 1 1))
+(define _isfloat (aux/fromrkt (λ (x) (and (not (exact-integer? x)) (real? x))) 1 1))
+
+;; for making binary predicates
+(define (aux/fromrkt.binpred fun newval?)
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (< (car stack) x) stack)))))
-;; _eq :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
-(define (_eq x)
+      (MachineState localEnv (cons (fun (cadr stack) (car stack)) (if newval? stack (cdr stack)))))))
+;; _lt :: {}[y:Number,x:Number] -> [result:Boolean,x:Number]
+(define _lt (aux/fromrkt.binpred < #f))
+(define _lt* (aux/fromrkt.binpred < #t))
+(define (_lt/1 x)
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (equal? x (car stack)) stack)))))
-(define (_gt x)
+      (let ([evaluated (evaluator state (list x))])
+        (MachineState localEnv (cons (< (car stack) (car (MachineState-stack evaluated))) stack))))))
+;; TODO:
+;; 2. complete _le(/1) and _ge(/1).
+(define _le (aux/fromrkt.binpred <= #f))
+(define _le* (aux/fromrkt.binpred <= #t))
+(define-primitive (_le/1 x)
+  (let ([evaluated (evaluator state (list x))])
+    (MachineState env (cons (<= (car stack) (car (MachineState-stack evaluated))) stack))))
+(define _ge (aux/fromrkt.binpred >= #f))
+(define _ge* (aux/fromrkt.binpred >= #t))
+(define-primitive (_ge/1 x)
+  (let ([evaluated (evaluator state (list x))])
+    (MachineState env (cons (>= (car stack) (car (MachineState-stack evaluated))) stack))))
+;; _eq :: {}[y:Number,x:Number] -> [result:Boolean,x:Number]
+(define _eq (aux/fromrkt.binpred equal? #f))
+(define _eq* (aux/fromrkt.binpred equal? #t))
+;; _eq/1 :: {x:Number}[y:Number] -> [result:Boolean,y:Number]
+(define (_eq/1 x)
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
-      (MachineState localEnv (cons (> (car stack) x) stack)))))
+      (let ([evaluated (evaluator state (list x))])
+        (MachineState localEnv (cons (= (car stack) (car (MachineState-stack evaluated))) stack))))))
+(define _gt (aux/fromrkt.binpred > #f))
+(define _gt* (aux/fromrkt.binpred > #t))
+(define (_gt/1 x)
+  (λ (evaluator state)
+    (let-values ([(localEnv stack) (toValues state)])
+      (let ([evaluated (evaluator state (list x))])
+        (MachineState localEnv (cons (> (car stack) (car (MachineState-stack evaluated))) stack))))))
+
 ;; predicate combinators.
 (define (_and x . rst)
   (λ (evaluator state)
@@ -246,10 +285,11 @@
     (let-values ([(localEnv stack) (toValues state)])
       (let ([evaluatedState (evaluator state (list x))])
         (MachineState localEnv (cons (not (car (MachineState-stack evaluatedState))) stack))))))
+
 ;; primitives for boolean values.
-(define _notbool (aux/fromrkt (λ (x) (not x)) 1))
-(define _andbool (aux/fromrkt (λ (x y) (and x y)) 2))
-(define _orbool (aux/fromrkt (λ (x y) (or x y)) 2))
+(define _notbool (aux/fromrkt (λ (x) (not x)) 1 0))
+(define _andbool (aux/fromrkt (λ (x y) (and x y)) 2 0))
+(define _orbool (aux/fromrkt (λ (x y) (or x y)) 2 0))
 
 
 ;; primitives for quoted values.
@@ -289,7 +329,35 @@
         (MachineState localEnv (cons (QuotedValue (QuotedValue-env quotedVal)
                                                   (drop-right (QuotedValue-cmdList quotedVal) 1))
                                      rst))))))
-(define (_substr start end)
+
+(define (aux/evalres evaluator state cmdlist)
+  (car (MachineState-stack (evaluator state cmdlist))))
+
+;; primitives for tables.
+;; lists are tables with special keys (just like lua).
+;; TODO: complete _getval & _setval
+;; _setval :: {}[v:val,k:key,d:table] -> [updated:table]
+(define-primitive _table
+  (MachineState env (cons (make-immutable-hash) stack)))
+(define _setval
+  (λ (evaluator state)
+    (let-values ([(localEnv stack) (toValues state)])
+      (let-values ([(value key table) (values (car stack) (cadr stack) (caddr stack))])
+        (MachineState localEnv (cons (hash-set table key value) (cdddr stack)))))))
+;; _setval/1 :: {k:key}[v:val,d:table] -> [updated:table]
+(define-primitive (_setval/1 key)
+  (let-values ([(value key table)
+                (values (car stack) (aux/evalres evaluator state (list key)) (cadr stack))])
+    (MachineState env (cons (hash-set table key value) (cddr stack)))))
+;; _setval/2 :: {k:key,v:val}[d:table] -> [updated:table]
+(define-primitive (_setval/2 key value)
+  (let-values ([(value key table)
+                (values (aux/evalres evaluator state (list value))
+                        (aux/evalres evaluator state (list key))
+                        (car stack))])
+    (MachineState env (cons (hash-set table key value) (cdr stack)))))
+
+(define (_substr/2 start end)
   (λ (evaluator state)
     (let-values ([(localEnv stack) (toValues state)])
       (MachineState localEnv (cons (substring (car stack) start end) stack)))))
@@ -319,39 +387,13 @@
          env))
 (define emptyEnv (Env #f (make-bindingEnv)))
 (define st (MachineState emptyEnv '()))
-
 (evaluator
  st
- `(,(_quoted `(,(_load 'x) ,_dup))
-   ,(_define 'mydup '(x))
-   ,(_quoted
-     `(,(_load 'x)
-       ,(_lt 2)
-       ,(_branch
-         `(,_pop ,(_lit 1))
-         `(,(_call 'factorial (_immediate (_load 'x) _dec))
-           ,_mult
-           ))))
-   ,(_define 'factorial '(x))
-   ,(_lit 5)
-   ,(_call 'factorial)
-   ))
-#|
-(evaluator
- st
- `(,(_lit 3)
-   ,(_and (_or (_lt 3) (_lt 6)))
-   ,(_quoted `(,(_lit 3)))
+ `(,_table
    ,(_lit 3)
-   ,_putbefore
+   ,(_lit 4)
+   ,_setval
+   ,(_lit "val2")
+   ,(_setval/1 (_lit "key2"))
+   ,(_setval/2 (_immediate (_lit 3) (_lit 9) _plus) (_lit "val3"))
    ))
-|#
-#|
-(velvet-evaluator
- st
- `(,(_quoted `(,_swap ,_dup))
-   ,(_branch
-     `(,(_lit 3))
-     `(,(_lit 4)))))
-
-|#
